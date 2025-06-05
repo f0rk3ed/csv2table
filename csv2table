@@ -1,766 +1,784 @@
 #!/usr/bin/env python
 
+import argparse
+import csv
+import datetime
+import decimal
+import gzip
+import json
 import os
 import re
-import csv
 import signal
-import sys
-import json
-import decimal
-import datetime
-import argparse
-try:
-    from urlparse import urlparse
-except ImportError:
-    from urllib.parse import urlparse
-try:
-    from StringIO import StringIO
-except ImportError:
-    from io import StringIO
 import subprocess
+import sys
+from collections import defaultdict
+from dataclasses import dataclass, field
+from enum import Enum
+from pathlib import Path
+from typing import Dict, List, Optional, Tuple, Union
+from urllib.parse import urlparse
 
-
-TEXT = "text"
-INTEGER = "integer"
-NUMERIC = "numeric"
-DATE = "date"
-DATETIME = "timestamp"
-DATETIMETZ = "timestamptz"
-BIGINTEGER = "biginteger"
-JSON = "json"
-JSONB = "jsonb"
-EMPTY = None # special case, used as placeholder for null upgrades
-
-# ignore pipe errors using head, etc
+# Ignore pipe errors and set CSV field size limit
 signal.signal(signal.SIGPIPE, signal.SIG_DFL)
-
-# without this, we may encounter fields larger than can be read
 csv.field_size_limit(sys.maxsize)
 
-parser = argparse.ArgumentParser()
-parser.add_argument("--file", "-f", help="csv file", required=True)
-parser.add_argument("--copy", "-y", help="issue a copy statement, for import",
-                    action="store_true", default=False)
-parser.add_argument("--backslash", "-s", help="when issuing copy, use \copy",
-                    action="store_true", default=False)
-parser.add_argument("--delimiter", "-d", help="csv delimiter", default=",")
-parser.add_argument("--quote", "-q", help="csv quote", default='"')
-parser.add_argument("--table", "-t", help="table name", default=None)
-parser.add_argument("--schema", help="schema name", default=None)
-parser.add_argument("--create-schema", help="create the named schema",
-                    action="store_true", default=False)
-parser.add_argument("--integer", "-i", help="integer columns",
-                    action="store_true", default=False)
-parser.add_argument("--numeric", "-n", help="numeric parsing",
-                    action="store_true", default=False)
-parser.add_argument("--timestamp", "-p", help="timestamp parsing",
-                    action="store_true", default=False)
-parser.add_argument("--date", help="date parsing",
-                    action="store_true", default=False)
-parser.add_argument("--tz", help="use timestamptz instead of timestamp",
-                    action="store_true", default=False)
-parser.add_argument("--mogrify", "-m", help="clean names",
-                    action="store_true", default=False)
-parser.add_argument("--lower", "-l", help="lowercase names",
-                    action="store_true", default=False)
-parser.add_argument("--drop", "-x", help="drop table first",
-                    action="store_true", default=False)
-parser.add_argument("--truncate", help="truncate table first",
-                    action="store_true", default=False)
-parser.add_argument("--skip-parsing", help="skip type parsing for cols")
-parser.add_argument("--parse-only", help="attempt type parsing only for cols")
-parser.add_argument("--big-integer", "-b", help="use bigint instead of int",
-                    default=False, action="store_true")
-parser.add_argument("--no-create", "-z", help="don't issue create table",
-                    default=False, action="store_true")
-parser.add_argument("--fix-duplicates",
-                    help=("handle duplicate column names by appending an "
-                          "increasing suffix"),
-                    default=False, action="store_true")
-parser.add_argument("--transaction", "-1", help="run in a transaction",
-                    default=False, action="store_true")
-parser.add_argument("--temporary", help="create a temporary table",
-                    default=False, action="store_true")
-parser.add_argument("--file-column",
-                    help=("add a column to the created table which will contain "
-                          "the name of the file the data was loaded from"),
-                    default=None)
-parser.add_argument("--redshift",
-                    help=("generate a copy command for redshift. takes an "
-                          "optional argument, a file to look for s3 "
-                          "credentials/bucket in. To try and read from the "
-                          "environment, specify <ENV>"),
-                    default=None)
-parser.add_argument("--redshift-bucket",
-                    help=("when generating a copy command for redshift, using "
-                          "this option specifies the bucket to store the file "
-                          "in, if requested. This will override any bucket found "
-                          "by the --redshift option."),
-                    default=None)
-parser.add_argument("--redshift-upload",
-                    help="upload the specified file to redshift",
-                    action="store_true", default=False)
-parser.add_argument("--gzip", help="the file is in gzip format",
-                    action="store_true", default=False)
-parser.add_argument("--missing-headers",
-                    help="file is missing headers, make up column names",
-                    action="store_true", default=False)
-parser.add_argument("--cine", help="create if not exists when creating a table",
-                    action="store_true", default=False)
-parser.add_argument("--keep-going", help=("read the N rows instead of the "
-                                          "first two rows, trading performance "
-                                          "for better type detection"),
-                    type=int, metavar="N", default=None)
-parser.add_argument("--primary-key", help=("column(s) to make part of the "
-                                          "primary key"))
-parser.add_argument("--serial-column", help=("add serial column of the given "
-                                             "name"))
-parser.add_argument("--array", help="attempt to detect and create array columns",
-                    action="store_true", default=False)
-group = parser.add_mutually_exclusive_group()
-group.add_argument("--json", help="attempt to detect and create json columns",
-                   action="store_true", default=False)
-group.add_argument("--jsonb", help="attempt to detect and create jsonb columns",
-                   action="store_true", default=False)
 
-args = parser.parse_args()
+class SQLType(Enum):
+    TEXT = "text"
+    INTEGER = "integer"
+    BIGINTEGER = "biginteger"
+    NUMERIC = "numeric"
+    DATE = "date"
+    TIMESTAMP = "timestamp"
+    TIMESTAMPTZ = "timestamptz"
+    JSON = "json"
+    JSONB = "jsonb"
+    EMPTY = None
 
-# check that our given file exists
-if not args.file or not os.path.exists(args.file):
-    sys.stderr.write("file '{}' does not exist.\n".format(args.file))
-    sys.exit(1)
 
-# check that a schema was given if create schema was requested
-if args.create_schema and args.schema is None:
-    sys.stderr.write("--create-schema given but --schema not provided.\n")
-    sys.exit(1)
+@dataclass
+class RedshiftConfig:
+    credentials_path: Optional[str] = None
+    bucket: Optional[str] = None
+    upload: bool = False
+    
+    def __post_init__(self):
+        if self.upload and not self.credentials_path:
+            self.credentials_path = "<ENV>"
 
-# if --redshift-upload is specified, and --redshift is not set, force it to
-# "<ENV>"
-if args.redshift_upload and not args.redshift:
-    args.redshift = "<ENV>"
 
-# --backslash is incompatible with --redshift
-if args.backslash and args.redshift:
-    sys.stderr.write("--backslash is incompatible with --redshift*")
-    sys.exit(1)
+@dataclass
+class Config:
+    file_path: str
+    table_name: Optional[str] = None
+    schema: Optional[str] = None
+    delimiter: str = ","
+    quote_char: str = '"'
+    
+    # Type detection
+    detect_integers: bool = False
+    detect_numeric: bool = False
+    detect_dates: bool = False
+    detect_timestamps: bool = False
+    detect_json: bool = False
+    detect_jsonb: bool = False
+    detect_arrays: bool = False
+    use_big_integers: bool = False
+    use_timestamptz: bool = False
+    
+    # Processing options
+    clean_names: bool = False
+    lowercase_names: bool = False
+    drop_table: bool = False
+    truncate_table: bool = False
+    create_schema: bool = False
+    no_create: bool = False
+    temporary_table: bool = False
+    create_if_not_exists: bool = False
+    fix_duplicates: bool = False
+    missing_headers: bool = False
+    is_gzipped: bool = False
+    transaction: bool = False
+    
+    # Copy options
+    generate_copy: bool = False
+    use_backslash_copy: bool = False
+    
+    # Analysis options
+    sample_rows: Optional[int] = None
+    skip_parsing_cols: List[str] = field(default_factory=list)
+    parse_only_cols: Optional[List[str]] = None
+    
+    # Additional columns
+    file_column: Optional[str] = None
+    serial_column: Optional[str] = None
+    primary_key: Optional[str] = None
+    
+    # Redshift support
+    redshift: Optional[RedshiftConfig] = None
 
-# redshift doesn't like plain NUMERIC, need to give it some precision otherwise
-# it loses decimals places...
-if args.redshift:
-    NUMERIC = "numeric(24, 8)"
 
-# we assume that for redshift, the default date format is 'YYYY-MM-DD'.
-# however, we may automatically detect a different one, so try to inform
-# redshift of our choices.
-redshift_date_format = "YYYY-MM-DD"
-redshift_time_format = "HH:MI:SS"
-redshift_datetime_format = "YYYY-MM-DD HH:MI:SS"
+@dataclass
+class Column:
+    name: str
+    sql_type: SQLType
+    is_array: bool = False
 
-# identifier quoting function
-def quote_ident(name):
-    name = name.replace('"', '""')
-    return '"' + name + '"'
 
-# escape helper
-def escape(val):
-    return val.replace("'", "''")
-
-# name cleaner function
-empties = ""
-def clean_name(name):
-    global empties
-    name = name.strip()
-    name = re.sub(r'[^a-zA-Z0-9_]', "_", name)
-    name = re.sub(r'_+', "_", name)
-    name = re.sub(r'_$', "", name)
-    if args.lower:
-        name = name.lower()
-    if not name:
-        empties += "_"
-        name = empties + ""
-    return name
-
-# construct a table name from the file name
-if args.table is None:
-    path_parts = os.path.split(args.file)
-    file_name = path_parts[1]
-
-    pieces = file_name.split(".")
-    if len(pieces) > 1:
-        if pieces[-1] == "gz":
-            pieces.pop()
-        pieces = pieces[:-1]
-
-    table_name = ".".join(pieces)
-
-    if args.mogrify:
-        table_name = clean_name(table_name)
-else:
-    table_name = args.table
-
-# determine any columns we should not type parse
-skip_type_parsing = []
-if args.skip_parsing:
-    cols = args.skip_parsing.split(",")
-    skip_type_parsing = [c.strip() for c in cols]
-
-# determine any columns which we should only type parse
-parse_only_cols = None
-if args.parse_only:
-    cols = args.parse_only.split(",")
-    parse_only_cols = [c.strip() for c in cols]
-
-# get a handle on things
-if args.gzip:
-    process = subprocess.Popen(
-        ["zcat", args.file],
-        stdout=subprocess.PIPE,
-        universal_newlines=True,
-    )
-    fp = process.stdout
-else:
-    fp = open(args.file, "rU")
-
-# attempt to deserialize an array
-def parse_array(value):
-    if not (value.startswith("{") and value.endswith("}")):
-        raise ValueError("not an array")
-
-    value = re.sub(r'^[{](.*)[}]$', r'\1', value)
-
-    array_fp = StringIO(value)
-    array_reader = csv.reader(array_fp)
-    try:
-        array = next(array_reader)
-    except StopIteration:
-        raise ValueError("not an array")
-
-    return array
-
-# try and figure out the type of the given value
-def get_type(value, args):
-
-    global redshift_date_format
-    global redshift_time_format
-    global redshift_datetime_format
-
-    # date formats will be crossed with time formats
-    date_formats = [
-        "%Y-%m-%d",
-        "%Y%m%d",
-        "%m/%d/%Y",
-        "%b %d, %Y",
-        "%m/%d/%y",
-    ]
-
-    time_formats = [
-        "%H:%M:%S",
-        "%H:%M:%S %z",
-        "%H:%M:%S %Z",
-        "%I:%M:%S %p",
-        "%I:%M:%S %P",
-        "%H:%M:%S.%f",
-        "%H:%M:%S.%f %z",
-        "%H:%M:%S.%f %Z",
-        "%I:%M:%S.%f %p",
-        "%I:%M:%S.%f %P",
-        "%H:%M",
-    ]
-
-    redshift_date_formats = {
+class TypeDetector:
+    # Date/time format mappings for Redshift
+    DATE_FORMATS = {
         "%Y-%m-%d": "YYYY-MM-DD",
-        "%Y%m%d": "YYYYMMDD",
+        "%Y%m%d": "YYYYMMDD", 
         "%m/%d/%Y": "MM/DD/YYYY",
         "%b %d, %Y": "MON DD, YYYY",
-        "%m/%d/%y": "MM/DD/YY",
+        "%m/%d/%y": "MM/DD/YY"
     }
-
-    redshift_time_formats = {
+    
+    TIME_FORMATS = {
         "%H:%M:%S": "HH:MM:SS",
-        "%H:%M:%S %z": "HH:MM:SS", # XXX
-        "%H:%M:%S %Z": "HH:MM:SS", # XXX
+        "%H:%M:%S %z": "HH:MM:SS",
         "%I:%M:%S %p": "HH12:MM:SS AM",
-        "%I:%M:%S %P": "HH12:MM:SS AM",
         "%H:%M:%S.%f": "HH:MM:SS",
-        "%H:%M:%S.%f %z": "HH:MM:SS", # XXX
-        "%H:%M:%S.%f %Z": "HH:MM:SS", # XXX
-        "%I:%M:%S.%f %p": "HH12:MM:SS AM",
-        "%I:%M:%S.%f %P": "HH12:MM:SS AM",
-        "%H:%M": "HH:MM",
+        "%H:%M": "HH:MM"
     }
-
-    redshift_datetime_formats = {}
-
-    datetime_formats = []
-    for date_format in date_formats:
-        datetime_formats.append(date_format)
-        for time_format in time_formats:
-            datetime_formats.append(date_format + " " + time_format)
-            datetime_formats.append(date_format + "T" + time_format)
-
-            redshift_datetime_formats[date_format] = redshift_date_formats[date_format]
-            redshift_datetime_formats[date_format + " " + time_format] = (
-                redshift_date_formats[date_format]
-                + " "
-                + redshift_time_formats[time_format]
-            )
-
-    if args.array:
+    
+    def __init__(self, config: Config):
+        self.config = config
+        self.redshift_date_format = "YYYY-MM-DD"
+        self.redshift_datetime_format = "YYYY-MM-DD HH:MM:SS"
+        
+        # Adjust numeric type for Redshift
+        if config.redshift:
+            SQLType.NUMERIC._value_ = "numeric(24, 8)"
+    
+    def detect_type(self, value: str) -> Tuple[SQLType, bool]:
+        if not value.strip():
+            return SQLType.EMPTY, False
+        
+        # Array detection first
+        if self.config.detect_arrays and self._is_array(value):
+            return self._detect_array_type(value)
+        
+        # Date detection
+        if self.config.detect_dates:
+            for fmt, redshift_fmt in self.DATE_FORMATS.items():
+                if self._try_parse_datetime(value, fmt):
+                    self.redshift_date_format = redshift_fmt
+                    return SQLType.DATE, False
+        
+        # Timestamp detection
+        if self.config.detect_timestamps:
+            for date_fmt, rs_date_fmt in self.DATE_FORMATS.items():
+                if self._try_parse_datetime(value, date_fmt):
+                    self.redshift_datetime_format = rs_date_fmt
+                    return (SQLType.TIMESTAMPTZ if self.config.use_timestamptz 
+                           else SQLType.TIMESTAMP), False
+                
+                for time_fmt, rs_time_fmt in self.TIME_FORMATS.items():
+                    for sep in [" ", "T"]:
+                        full_fmt = f"{date_fmt}{sep}{time_fmt}"
+                        if self._try_parse_datetime(value, full_fmt):
+                            self.redshift_datetime_format = f"{rs_date_fmt} {rs_time_fmt}"
+                            return (SQLType.TIMESTAMPTZ if self.config.use_timestamptz 
+                                   else SQLType.TIMESTAMP), False
+        
+        # Integer detection
+        if self.config.detect_integers and self._is_integer(value):
+            return (SQLType.BIGINTEGER if self.config.use_big_integers 
+                   else SQLType.INTEGER), False
+        
+        # Numeric detection
+        if self.config.detect_numeric and self._is_numeric(value):
+            return SQLType.NUMERIC, False
+        
+        # JSON detection
+        if (self.config.detect_json or self.config.detect_jsonb) and self._is_json(value):
+            return (SQLType.JSONB if self.config.detect_jsonb else SQLType.JSON), False
+        
+        return SQLType.TEXT, False
+    
+    def _is_array(self, value: str) -> bool:
+        return value.startswith("{") and value.endswith("}")
+    
+    def _try_parse_datetime(self, value: str, fmt: str) -> bool:
         try:
-            values = parse_array(value)
-            
-            types = []
-            for v in values:
-                t, _ = get_type(v, args)
-                types.append(t)
-
-            if len(list(set(types))) == 1:
-                return types[0], True
-
+            datetime.datetime.strptime(value, fmt)
+            return len(value) == 8 if fmt == "%Y%m%d" else True
         except ValueError:
-            pass
-    else:
-        pass
-
-    # first the date
-    if args.date:
-        for date_format in date_formats:
-            try:
-                datetime.datetime.strptime(value, date_format)
-                if not (len(value) != 8 and date_format == "%Y%m%d"):
-
-                    # hacks, but we'll sort of assume everything is in the same
-                    # format
-                    redshift_date_format = redshift_date_formats[date_format]
-
-                    return DATE, False
-            except ValueError:
-                pass
-
-    # then timestamp
-    if args.timestamp:
-        for timestamp_format in datetime_formats:
-            try:
-                datetime.datetime.strptime(value, timestamp_format)
-                if not (len(value) != 8 and timestamp_format == "%Y%m%d"):
-
-                    # hacks, but we'll sort of assume everything is in the same
-                    # format
-                    redshift_time_format = redshift_datetime_formats[timestamp_format]
-
-                    if args.tz:
-                        return DATETIMETZ, False
-                    else:
-                        return DATETIME, False
-            except ValueError:
-                pass
-
-    # then integers
-    if args.integer:
+            return False
+    
+    def _is_integer(self, value: str) -> bool:
         try:
             int(value)
-            if args.big_integer:
-                return BIGINTEGER, False
-            else:
-                return INTEGER, False
+            return True
         except ValueError:
-            pass
-
-    # then numeric
-    if args.numeric:
+            return False
+    
+    def _is_numeric(self, value: str) -> bool:
         try:
             decimal.Decimal(value)
-            return NUMERIC, False
+            return True
         except decimal.InvalidOperation:
-            pass
-
-    # json/jsonb
-    if args.json or args.jsonb:
-
-        # yes, techinically more values are accepted. but then we'll try to
-        # convert any number to json, and that's probably not what we want
-        possibly_json = (
-            (value.startswith("{") and value.endswith("}"))
-            or (value.startswith("[") and value.endswith("]"))
-        )
-
-        if possibly_json:
-            try:
-                json.loads(value)
-                if args.json:
-                    return JSON, False
-                elif args.jsonb:
-                    return JSONB, False
-                else:
-                    raise Exception("Implementation Error")
-            except ValueError:
-                pass
+            return False
     
-    # we got nothing
-    return TEXT, False
+    def _is_json(self, value: str) -> bool:
+        if not ((value.startswith("{") and value.endswith("}")) or 
+                (value.startswith("[") and value.endswith("]"))):
+            return False
+        try:
+            json.loads(value)
+            return True
+        except (ValueError, json.JSONDecodeError):
+            return False
+    
+    def _detect_array_type(self, value: str) -> Tuple[SQLType, bool]:
+        try:
+            # Parse array content
+            inner = value[1:-1].strip()
+            if not inner:
+                return SQLType.TEXT, True
+            
+            # Simple CSV parsing for array elements
+            reader = csv.reader([inner])
+            elements = next(reader, [])
+            
+            if not elements:
+                return SQLType.TEXT, True
+            
+            # Detect type of first non-empty element
+            for elem in elements:
+                if elem.strip():
+                    elem_type, _ = self.detect_type(elem.strip())
+                    return elem_type, True
+            
+            return SQLType.TEXT, True
+        except Exception:
+            return SQLType.TEXT, False
 
-# some help to pass tabs
-delimiter = args.delimiter
-if delimiter in ("\\t", "\\\\t", "tab", "TAB"):
-    delimiter = "\t"
 
-# start processing the file
-first = True
-header_mapping = {}
-reader = csv.DictReader(fp, delimiter=delimiter, quotechar=args.quote)
-
-# figure out the column name and types
-seen_column_names = {}
-
-# try to strip out the unicode bom, thanks new excel
-def strip_bom(field):
-    if field[:1] == "\ufeff":
-        field = field[1:]
-
-    try:
-        field_bytes = bytes(field)
-    except TypeError as tex:
-        if "string argument without an encoding" not in str(tex):
-            raise
-        else:
-            return field
-
-    if field_bytes[:3] == b"\xef\xbb\xbf":
-        return field[3:]
-
-    return field
-
-# if a file name column was requested, pre-seed that name here
-if args.file_column is not None:
-    seen_column_names[args.file_column] = 0
-
-columns = []
-
-for record_idx, record in enumerate(reader):
-    fields = reader.fieldnames
-
-    if not header_mapping:
-        if args.mogrify:
-            for field in fields:
-                header_mapping[field] = clean_name(strip_bom(field))
-        else:
-            # strip quotes to work with less chance of failure.
-            header_mapping = {f: strip_bom(f).replace('"', "") for f in fields}
-
-    # by default, every column will be unset
-    if not columns:
-        columns = [None] * len(fields)
-
-    # build a table with some hopefully reasonable types
-    for i, field in enumerate(fields):
-        value = record[field]
-
-        # typed columns (with maybe nice names)
-        if field in skip_type_parsing \
-                or header_mapping[field] in skip_type_parsing:
-            if not value:
-                column_type, is_array = EMPTY, False
-            else:
-                column_type, is_array = TEXT, False
-        else:
-            if not value:
-                column_type, is_array = EMPTY, False
-            else:
-                column_type, is_array = get_type(value, args)
-
-        # but un-type the given columns if parse only was requested
-        if parse_only_cols is not None:
-            if field not in parse_only_cols:
-                if not value:
-                    column_type, is_array = EMPTY, False
-                else:
-                    column_type, is_array = TEXT, False
-
-        if args.missing_headers:
-            column_name = "col_{}".format(i)
-        else:
-            column_name = header_mapping[field]
-            if args.fix_duplicates:
-                if column_name in seen_column_names:
-                    original_name = column_name
-                    suffix = seen_column_names[original_name] + 1
-                    column_name = "{}_{}".format(original_name, suffix)
-                    seen_column_names[original_name] = suffix
-                else:
-                    seen_column_names[column_name] = 0
-
-        # not seen, use what we've got
-        if columns[i] is None:
-            columns[i] = (column_name, column_type, is_array)
-
-        # column seen previously, figure out if the type needs to be adjusted
-        else:
-
-            # certain types will be automatically "broadened"
-            upgrades = {
-                INTEGER: [NUMERIC],
-                BIGINTEGER: [NUMERIC],
-                DATE: [DATETIME, DATETIMETZ],
-            }
-
-            prior_type = columns[i][1]
-            prior_is_array = columns[i][2]
-
-            # mis-matching array determination means we're just gonna use text
-            if prior_is_array != is_array:
-                columns[i] = (column_name, TEXT, False)
-
-            elif prior_type != column_type:
-
-                # empty is null for any type, if the previous type was empty,
-                # upgrade to anything
-                if prior_type == EMPTY:
-                    columns[i] = (column_name, column_type, is_array)
-
-                # if current type is empty, don't change whichever type we've
-                # already guessed
-                elif column_type == EMPTY:
-                    pass
-
-                # see if the type can be broadened
-                elif prior_type in upgrades and column_type in upgrades[prior_type]:
-                    columns[i] = (column_name, column_type, is_array)
-
-                # see if the type is broad, to avoid narrowing
-                elif column_type in upgrades and prior_type in upgrades[column_type]:
-                    pass
-
-                # otherwise, force to text
-                else:
-                    columns[i] = (column_name, TEXT, is_array)
-
-    # enough of this boring crap
-    if not args.keep_going or args.keep_going < record_idx:
-        break
-
-# if we're using gzip, kill the process we started
-if args.gzip:
-    process.kill()
-
-# if redshift was requested, attempt to figure out our credentials and bucket.
-# note that we'll potentially need access to the credentials below, so define
-# some variables up here
-aws_access_key_id = None
-aws_secret_access_key = None
-s3_path = None
-
-if args.redshift:
-
-    def read_redshift_file(path):
-        aws_access_key_id = None
-        aws_secret_access_key = None
-        s3_bucket = None
-        s3_transfer_bucket = None
+class RedshiftManager:
+    def __init__(self, config: RedshiftConfig):
+        self.config = config
+        self.aws_access_key_id = None
+        self.aws_secret_access_key = None
+        self.s3_bucket = None
+        self._load_credentials()
+    
+    def _load_credentials(self):
+        if self.config.credentials_path == "<ENV>":
+            self._load_from_env()
+        elif self.config.credentials_path:
+            self._load_from_file(self.config.credentials_path)
         
-        if os.path.exists(path):
-
-            # open and "parse" file. because this file can actually contain
-            # no headers, we can't really use ConfigParser
-            with open(path, "r") as rfp:
-                for line in rfp.readlines():
-                    if line.startswith("#"):
-                        continue
-
-                    id_match = re.search(r'(AWSAccessKeyId|aws_access_key_id|access_key|s3.account_id)\s*=\s*(.+)$', line)
-                    if id_match:
-                        aws_access_key_id = id_match.groups()[1].strip()
-
-                    key_match = re.search(r'(AWSSecretKey|aws_secret_access_key|secret_key|s3.private_key)\s*=\s*(.+)$', line)
-                    if key_match:
-                        aws_secret_access_key = key_match.groups()[1].strip()
-
-                    bucket_match = re.search(r's3.bucket\s*=\s*(.+)$', line)
-                    if bucket_match:
-                        s3_bucket = bucket_match.groups()[0].strip()
-
-                    transfer_match = re.search(r's3.transfer_bucket\s*=\s*(.+)$', line)
-                    if transfer_match:
-                        s3_transfer_bucket = transfer_match.groups()[0].strip()
-
-        return aws_access_key_id, aws_secret_access_key, (s3_transfer_bucket or s3_bucket)
-
-    if args.redshift == "<ENV>":
-        aws_access_key_id = os.getenv("AWS_ACCESS_KEY_ID")
-        aws_secret_access_key = os.getenv("AWS_SECRET_ACCESS_KEY")
-        s3_bucket = os.getenv("S3_BUCKET")
-
-        # maybe we didn't find a key, look for a credentials specified in the
-        # env
-        if aws_access_key_id is None:
-            credentials_path = os.getenv("AWS_CREDENTIAL_FILE")
-            maybe_key_id, maybe_key, maybe_bucket = read_redshift_file(credentials_path)
-            if aws_access_key_id is None:
-                aws_access_key_id = maybe_key_id
-            if aws_secret_access_key is None:
-                aws_secret_access_key = maybe_key
-            if s3_bucket is None:
-                s3_bucket = maybe_bucket
-    else:
-        aws_access_key_id, aws_secret_access_key, s3_bucket = read_redshift_file(args.redshift)
-
-    if args.redshift_bucket:
-        s3_bucket = args.redshift_bucket
-
-    # we need to have access credentials and a bucket, abort if not found
-    if aws_access_key_id is None:
-        sys.stderr.write("unable to determine aws_access_key_id")
-        sys.exit(1)
-
-    if aws_secret_access_key is None:
-        sys.stderr.write("unable to determine aws_secret_access_key")
-        sys.exit(1)
-
-    if s3_bucket is None:
-        sys.stderr.write("unable to determine s3_bucket")
-        sys.exit(1)
-
-    # now, build a url from our components. we will then parse this url to get
-    # our bucket and key name components, because the bucket may have been
-    # specified with a prefix
-    s3_path = "s3://" + os.path.join(s3_bucket, os.path.basename(args.file))
-    parsed = urlparse(s3_path)
-    real_bucket = parsed.netloc
-    real_key = parsed.path.lstrip("/")
-
-    # if redshift upload was requested, attempt to upload the file
-    if args.redshift_upload:
-
-        # we import botocore here so it's not always required
-        import botocore.session
-
-        bs = botocore.session.get_session()
-        s3_client = bs.create_client(
-            service_name="s3",
-            aws_access_key_id=aws_access_key_id,
-            aws_secret_access_key=aws_secret_access_key,
-        )
-
-        with open(args.file, "rb") as upload_fp:
-            s3_client.put_object(
-                Bucket=real_bucket,
-                Key=real_key,
-                Body=upload_fp,
-            )
-
-# generate our name clause
-name_clause = ""
-if args.schema:
-    name_clause += quote_ident(args.schema) + "."
-name_clause += quote_ident(table_name)
-
-# generate our columns clause for table create
-columns_fragments = []
-for column_name, column_type, is_array in columns:
-    if column_type == EMPTY:
-        column_type = TEXT
-
-    column_fragment = "    {} {}".format(quote_ident(column_name), column_type)
-    if is_array:
-        column_fragment += "[]"
-
-    columns_fragments.append(column_fragment)
-
-# if we requested a column containing the filename, add that in
-if args.file_column is not None:
-    file_column_frag = ("    {} text default '{}'"
-                        .format(quote_ident(args.file_column),
-                                escape(args.file)))
-    columns_fragments = [file_column_frag] + columns_fragments
-
-columns_clause = ",\n".join(columns_fragments)
-
-# generate the target clause to emit with the copy statement
-targets_clause = ", ".join([quote_ident(c[0]) for c in columns])
-
-# maybe print a begin
-if args.transaction:
-    print("begin;")
-
-# maybe print our a schema create
-if args.create_schema:
-    print("create schema {};".format(quote_ident(args.schema)))
-
-# maybe print out a drop
-if args.drop and not args.no_create:
-
-    # redshift doesn't know about if exists, sigh
-    if args.redshift:
-        print("drop table {};".format(name_clause))
-    else:
-        print("drop table if exists {};".format(name_clause))
-
-# print out our table create statement
-if not args.no_create:
-    table_clause = "create table"
-    if args.temporary:
-        table_clause = "create temporary table"
-    if args.cine:
-        table_clause += " if not exists"
-    print("{} {} (".format(table_clause, name_clause))
-
-    if args.serial_column:
-        print('    {} serial,'.format(quote_ident(args.serial_column)))
-
-    print(columns_clause + ("," if args.primary_key else ""))
-
-    if args.primary_key:
-        pkey = [c.strip() for c in args.primary_key.split(",") if c.strip()]
-
-        pkey_clause = []
-
-        if args.serial_column in pkey:
-            pkey_clause.append(quote_ident(args.serial_column))
-
-        for field in fields:
-            if field in pkey or header_mapping[field] in pkey:
-                col = header_mapping[field]
-                pkey_clause.append(quote_ident(col))
-
-        pkey_clause = "    primary key (" + ", ".join(pkey_clause) + ")"
-        print(pkey_clause)
-
-    print(");")
-
-# print out our truncate statement
-if args.truncate:
-    print("truncate table {};".format(name_clause))
-
-# print out our copy statement
-if args.copy:
+        if self.config.bucket:
+            self.s3_bucket = self.config.bucket
+        
+        self._validate_credentials()
     
-    # generate our options clause
-    if args.redshift:
-        options = ("'{}' with credentials 'aws_access_key_id={};aws_secret_access_key={}' "
-                   "csv ignoreheader 1 delimiter '{}' quote '{}' dateformat "
-                   "'{}' timeformat '{}'"
-                   .format(escape(s3_path), escape(aws_access_key_id),
-                           escape(aws_secret_access_key),
-                           escape(delimiter), escape(args.quote),
-                           redshift_date_format,
-                           redshift_datetime_format))
-        if args.gzip:
-            options += " gzip"
-    else:
-        if args.gzip:
-            start = "program 'gunzip < {}'".format(escape(args.file))
+    def _load_from_env(self):
+        self.aws_access_key_id = os.getenv("AWS_ACCESS_KEY_ID")
+        self.aws_secret_access_key = os.getenv("AWS_SECRET_ACCESS_KEY")
+        self.s3_bucket = os.getenv("S3_BUCKET")
+        
+        # Try AWS credential file if env vars not found
+        if not self.aws_access_key_id:
+            cred_file = os.getenv("AWS_CREDENTIAL_FILE")
+            if cred_file:
+                self._load_from_file(cred_file)
+    
+    def _load_from_file(self, path: str):
+        if not os.path.exists(path):
+            return
+        
+        patterns = {
+            'access_key': r'(AWSAccessKeyId|aws_access_key_id|access_key|s3\.account_id)\s*=\s*(.+)$',
+            'secret_key': r'(AWSSecretKey|aws_secret_access_key|secret_key|s3\.private_key)\s*=\s*(.+)$',
+            'bucket': r's3\.bucket\s*=\s*(.+)$',
+            'transfer_bucket': r's3\.transfer_bucket\s*=\s*(.+)$'
+        }
+        
+        with open(path) as f:
+            for line in f:
+                if line.startswith("#"):
+                    continue
+                
+                for key, pattern in patterns.items():
+                    match = re.search(pattern, line)
+                    if match:
+                        value = match.group(2 if key in ['access_key', 'secret_key'] else 1).strip()
+                        if key == 'access_key':
+                            self.aws_access_key_id = value
+                        elif key == 'secret_key':
+                            self.aws_secret_access_key = value
+                        elif key == 'transfer_bucket':
+                            self.s3_bucket = value  # Transfer bucket takes precedence
+                        elif key == 'bucket' and not self.s3_bucket:
+                            self.s3_bucket = value
+    
+    def _validate_credentials(self):
+        if not all([self.aws_access_key_id, self.aws_secret_access_key, self.s3_bucket]):
+            missing = []
+            if not self.aws_access_key_id:
+                missing.append("aws_access_key_id")
+            if not self.aws_secret_access_key:
+                missing.append("aws_secret_access_key")
+            if not self.s3_bucket:
+                missing.append("s3_bucket")
+            raise ValueError(f"Missing Redshift credentials: {', '.join(missing)}")
+    
+    def get_s3_path(self, file_path: str) -> str:
+        s3_url = f"s3://{os.path.join(self.s3_bucket, os.path.basename(file_path))}"
+        return s3_url
+    
+    def upload_file(self, file_path: str):
+        if not self.config.upload:
+            return
+        
+        try:
+            import botocore.session
+        except ImportError:
+            raise ImportError("botocore required for Redshift upload")
+        
+        s3_path = self.get_s3_path(file_path)
+        parsed = urlparse(s3_path)
+        bucket = parsed.netloc
+        key = parsed.path.lstrip("/")
+        
+        session = botocore.session.get_session()
+        client = session.create_client(
+            service_name="s3",
+            aws_access_key_id=self.aws_access_key_id,
+            aws_secret_access_key=self.aws_secret_access_key,
+        )
+        
+        with open(file_path, "rb") as f:
+            client.put_object(Bucket=bucket, Key=key, Body=f)
+
+
+class NameCleaner:
+    def __init__(self, config: Config):
+        self.config = config
+        self.empty_counter = 0
+    
+    def clean(self, name: str) -> str:
+        name = self._strip_bom(name)
+        
+        if not self.config.clean_names:
+            return name.replace('"', '')
+        
+        name = name.strip()
+        name = re.sub(r'[^a-zA-Z0-9_]', '_', name)
+        name = re.sub(r'_+', '_', name).strip('_')
+        
+        if self.config.lowercase_names:
+            name = name.lower()
+        
+        if not name:
+            self.empty_counter += 1
+            name = "_" * self.empty_counter
+        
+        return name
+    
+    @staticmethod
+    def _strip_bom(field: str) -> str:
+        if field.startswith('\ufeff'):
+            return field[1:]
+        try:
+            if field.encode('utf-8')[:3] == b'\xef\xbb\xbf':
+                return field[3:]
+        except (UnicodeEncodeError, AttributeError):
+            pass
+        return field
+
+
+class CSVAnalyzer:
+    TYPE_UPGRADES = {
+        SQLType.INTEGER: [SQLType.NUMERIC],
+        SQLType.BIGINTEGER: [SQLType.NUMERIC],
+        SQLType.DATE: [SQLType.TIMESTAMP, SQLType.TIMESTAMPTZ],
+    }
+    
+    def __init__(self, config: Config):
+        self.config = config
+        self.detector = TypeDetector(config)
+        self.cleaner = NameCleaner(config)
+        self.seen_names = defaultdict(int)
+    
+    def analyze(self) -> List[Column]:
+        # Handle gzipped files
+        if self.config.is_gzipped:
+            process = subprocess.Popen(
+                ["zcat", self.config.file_path],
+                stdout=subprocess.PIPE,
+                universal_newlines=True,
+            )
+            fp = process.stdout
         else:
-            start = "'{}'".format(escape(args.file))
-        options = start + (" with csv header delimiter '{}' quote '{}'"
-                           .format(escape(delimiter), escape(args.quote)))
+            fp = open(self.config.file_path, "r", newline='')
+        
+        try:
+            reader = csv.DictReader(
+                fp, 
+                delimiter=self.config.delimiter,
+                quotechar=self.config.quote_char
+            )
+            
+            columns = []
+            for row_idx, row in enumerate(reader):
+                if not columns:
+                    columns = self._init_columns(reader.fieldnames)
+                
+                self._update_columns(columns, row, reader.fieldnames)
+                
+                if (self.config.sample_rows and 
+                    row_idx >= self.config.sample_rows):
+                    break
+            
+            return columns
+        finally:
+            if self.config.is_gzipped:
+                process.kill()
+            else:
+                fp.close()
+    
+    def _init_columns(self, fieldnames: List[str]) -> List[Column]:
+        if self.config.file_column:
+            self.seen_names[self.config.file_column] = 0
+        
+        columns = []
+        for i, field in enumerate(fieldnames):
+            if self.config.missing_headers:
+                name = f"col_{i}"
+            else:
+                name = self._get_unique_name(field)
+            columns.append(Column(name, SQLType.EMPTY))
+        
+        return columns
+    
+    def _get_unique_name(self, field: str) -> str:
+        name = self.cleaner.clean(field)
+        
+        if self.config.fix_duplicates and name in self.seen_names:
+            self.seen_names[name] += 1
+            name = f"{name}_{self.seen_names[name]}"
+        else:
+            self.seen_names[name] = 0
+        
+        return name
+    
+    def _update_columns(self, columns: List[Column], row: Dict, fieldnames: List[str]):
+        for i, field in enumerate(fieldnames):
+            value = row[field]
+            
+            if self._should_skip_parsing(field, columns[i].name):
+                new_type = SQLType.TEXT if value else SQLType.EMPTY
+                is_array = False
+            else:
+                new_type, is_array = self.detector.detect_type(value)
+            
+            columns[i] = self._merge_types(columns[i], new_type, is_array)
+    
+    def _should_skip_parsing(self, field: str, clean_name: str) -> bool:
+        if self.config.parse_only_cols:
+            return field not in self.config.parse_only_cols
+        return (field in self.config.skip_parsing_cols or 
+                clean_name in self.config.skip_parsing_cols)
+    
+    def _merge_types(self, column: Column, new_type: SQLType, is_array: bool) -> Column:
+        if column.sql_type == SQLType.EMPTY:
+            return Column(column.name, new_type, is_array)
+        
+        if new_type == SQLType.EMPTY:
+            return column
+        
+        if column.is_array != is_array:
+            return Column(column.name, SQLType.TEXT, False)
+        
+        if column.sql_type == new_type:
+            return column
+        
+        # Check upgrades
+        if (column.sql_type in self.TYPE_UPGRADES and 
+            new_type in self.TYPE_UPGRADES[column.sql_type]):
+            return Column(column.name, new_type, is_array)
+        
+        if (new_type in self.TYPE_UPGRADES and 
+            column.sql_type in self.TYPE_UPGRADES[new_type]):
+            return column
+        
+        return Column(column.name, SQLType.TEXT, False)
 
-    copy = "copy"
-    if args.backslash:
-        copy = r'\copy'
 
-    print("{} {}({}) from {};".format(copy, name_clause, targets_clause, options))
+class SQLGenerator:
+    def __init__(self, config: Config):
+        self.config = config
+        self.redshift_manager = None
+        if config.redshift:
+            self.redshift_manager = RedshiftManager(config.redshift)
+    
+    def generate(self, columns: List[Column]) -> str:
+        statements = []
+        
+        if self.config.transaction:
+            statements.append("BEGIN;")
+        
+        if self.config.create_schema and self.config.schema:
+            statements.append(f"CREATE SCHEMA {self._quote(self.config.schema)};")
+        
+        table_name = self._get_table_name()
+        full_name = self._get_full_table_name(table_name)
+        
+        if self.config.drop_table and not self.config.no_create:
+            drop_sql = "DROP TABLE {};"
+            if not self.config.redshift:
+                drop_sql = "DROP TABLE IF EXISTS {};"
+            statements.append(drop_sql.format(full_name))
+        
+        if not self.config.no_create:
+            statements.append(self._create_table_sql(full_name, columns))
+        
+        if self.config.truncate_table:
+            statements.append(f"TRUNCATE TABLE {full_name};")
+        
+        if self.config.generate_copy:
+            statements.append(self._copy_sql(full_name, columns))
+        
+        if self.config.transaction:
+            statements.append("COMMIT;")
+        
+        # Handle Redshift upload
+        if self.redshift_manager and self.config.redshift.upload:
+            self.redshift_manager.upload_file(self.config.file_path)
+        
+        return "\n".join(statements)
+    
+    def _get_table_name(self) -> str:
+        if self.config.table_name:
+            return self.config.table_name
+        
+        # Extract table name from file path
+        path = Path(self.config.file_path)
+        name = path.stem
+        if path.suffix == '.gz':
+            name = Path(name).stem
+        
+        return self.cleaner.clean(name) if self.config.clean_names else name
+    
+    def _get_full_table_name(self, table_name: str) -> str:
+        if self.config.schema:
+            return f"{self._quote(self.config.schema)}.{self._quote(table_name)}"
+        return self._quote(table_name)
+    
+    def _create_table_sql(self, full_name: str, columns: List[Column]) -> str:
+        create_stmt = "CREATE"
+        if self.config.temporary_table:
+            create_stmt += " TEMPORARY"
+        create_stmt += " TABLE"
+        if self.config.create_if_not_exists:
+            create_stmt += " IF NOT EXISTS"
+        
+        lines = [f"{create_stmt} {full_name} ("]
+        
+        # Add serial column
+        if self.config.serial_column:
+            lines.append(f"    {self._quote(self.config.serial_column)} SERIAL,")
+        
+        # Add file column
+        if self.config.file_column:
+            escaped = self.config.file_path.replace("'", "''")
+            lines.append(f"    {self._quote(self.config.file_column)} TEXT DEFAULT '{escaped}',")
+        
+        # Add data columns
+        for column in columns:
+            sql_type = column.sql_type.value if column.sql_type != SQLType.EMPTY else "text"
+            type_str = f"{sql_type}{'[]' if column.is_array else ''}"
+            lines.append(f"    {self._quote(column.name)} {type_str},")
+        
+        # Remove trailing comma
+        if lines[-1].endswith(','):
+            lines[-1] = lines[-1][:-1]
+        
+        # Add primary key
+        if self.config.primary_key:
+            pkey_cols = [col.strip() for col in self.config.primary_key.split(",")]
+            quoted_cols = [self._quote(col) for col in pkey_cols if col]
+            if self.config.serial_column:
+                quoted_cols.insert(0, self._quote(self.config.serial_column))
+            lines.append(f"    PRIMARY KEY ({', '.join(quoted_cols)})")
+        
+        lines.append(");")
+        return "\n".join(lines)
+    
+    def _copy_sql(self, full_name: str, columns: List[Column]) -> str:
+        targets = ", ".join(self._quote(col.name) for col in columns)
+        copy_cmd = r"\copy" if self.config.use_backslash_copy else "COPY"
+        
+        if self.config.redshift and self.redshift_manager:
+            # Redshift COPY command
+            s3_path = self.redshift_manager.get_s3_path(self.config.file_path)
+            credentials = (f"aws_access_key_id={self.redshift_manager.aws_access_key_id};"
+                          f"aws_secret_access_key={self.redshift_manager.aws_secret_access_key}")
+            
+            options = (f"'{s3_path}' WITH CREDENTIALS '{credentials}' "
+                      f"CSV IGNOREHEADER 1 DELIMITER '{self._escape(self.config.delimiter)}' "
+                      f"QUOTE '{self._escape(self.config.quote_char)}'")
+            
+            if self.config.is_gzipped:
+                options += " GZIP"
+            
+            # Add date/time formats if detected
+            detector = self.detector if hasattr(self, 'detector') else TypeDetector(self.config)
+            options += f" DATEFORMAT '{detector.redshift_date_format}'"
+            options += f" TIMEFORMAT '{detector.redshift_datetime_format}'"
+            
+        else:
+            # PostgreSQL COPY command
+            if self.config.is_gzipped:
+                source = f"PROGRAM 'gunzip < {self._escape(self.config.file_path)}'"
+            else:
+                source = f"'{self._escape(self.config.file_path)}'"
+            
+            options = (f"{source} WITH CSV HEADER "
+                      f"DELIMITER '{self._escape(self.config.delimiter)}' "
+                      f"QUOTE '{self._escape(self.config.quote_char)}'")
+        
+        return f"{copy_cmd} {full_name}({targets}) FROM {options};"
+    
+    @staticmethod
+    def _quote(name: str) -> str:
+        return f'"{name.replace('"', '""')}"'
+    
+    @staticmethod 
+    def _escape(value: str) -> str:
+        return value.replace("'", "''")
 
-# maybe print out a commit
-if args.transaction:
-    print("commit;")
 
+def create_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(description="Generate PostgreSQL/Redshift schema from CSV")
+    
+    parser.add_argument("-f", "--file", required=True, help="CSV file path")
+    parser.add_argument("-t", "--table", help="Table name")
+    parser.add_argument("--schema", help="Schema name")
+    parser.add_argument("--create-schema", action="store_true", help="Create schema")
+    
+    # CSV options
+    parser.add_argument("-d", "--delimiter", default=",", help="CSV delimiter")
+    parser.add_argument("-q", "--quote", default='"', help="Quote character")
+    parser.add_argument("--gzip", action="store_true", help="Gzipped file")
+    parser.add_argument("--missing-headers", action="store_true", help="Generate column names")
+    
+    # Type detection
+    parser.add_argument("-i", "--integer", action="store_true", help="Detect integers")
+    parser.add_argument("-n", "--numeric", action="store_true", help="Detect numeric")
+    parser.add_argument("-p", "--timestamp", action="store_true", help="Detect timestamps")
+    parser.add_argument("--date", action="store_true", help="Detect dates")
+    parser.add_argument("--tz", action="store_true", help="Use timestamptz")
+    parser.add_argument("-b", "--big-integer", action="store_true", help="Use bigint")
+    parser.add_argument("--json", action="store_true", help="Detect JSON")
+    parser.add_argument("--jsonb", action="store_true", help="Detect JSONB")
+    parser.add_argument("--array", action="store_true", help="Detect arrays")
+    
+    # Name processing
+    parser.add_argument("-m", "--mogrify", action="store_true", help="Clean names")
+    parser.add_argument("-l", "--lower", action="store_true", help="Lowercase names")
+    parser.add_argument("--fix-duplicates", action="store_true", help="Handle duplicates")
+    
+    # Table options
+    parser.add_argument("-x", "--drop", action="store_true", help="Drop table first")
+    parser.add_argument("--truncate", action="store_true", help="Truncate table")
+    parser.add_argument("-z", "--no-create", action="store_true", help="Skip CREATE TABLE")
+    parser.add_argument("--temporary", action="store_true", help="Temporary table")
+    parser.add_argument("--cine", action="store_true", help="CREATE IF NOT EXISTS")
+    
+    # Copy options
+    parser.add_argument("-y", "--copy", action="store_true", help="Generate COPY")
+    parser.add_argument("-s", "--backslash", action="store_true", help="Use \\copy")
+    
+    # Analysis
+    parser.add_argument("--keep-going", type=int, help="Analyze N rows")
+    parser.add_argument("--skip-parsing", help="Skip parsing columns")
+    parser.add_argument("--parse-only", help="Parse only these columns")
+    
+    # Additional columns
+    parser.add_argument("--file-column", help="Add filename column")
+    parser.add_argument("--serial-column", help="Add serial column")
+    parser.add_argument("--primary-key", help="Primary key columns")
+    
+    # Transaction
+    parser.add_argument("-1", "--transaction", action="store_true", help="Use transaction")
+    
+    # Redshift options
+    parser.add_argument("--redshift", help="Redshift credentials file or <ENV>")
+    parser.add_argument("--redshift-bucket", help="S3 bucket override")
+    parser.add_argument("--redshift-upload", action="store_true", help="Upload to S3")
+    
+    return parser
+
+
+def main():
+    parser = create_parser()
+    args = parser.parse_args()
+    
+    # Validation
+    if not os.path.exists(args.file):
+        sys.stderr.write(f"File '{args.file}' does not exist.\n")
+        sys.exit(1)
+    
+    if args.create_schema and not args.schema:
+        sys.stderr.write("--create-schema requires --schema\n")
+        sys.exit(1)
+    
+    if args.backslash and args.redshift:
+        sys.stderr.write("--backslash incompatible with --redshift\n")
+        sys.exit(1)
+    
+    # Handle special delimiters
+    delimiter = args.delimiter
+    if delimiter.lower() in ('\\t', '\\\\t', 'tab'):
+        delimiter = '\t'
+    
+    # Build configuration
+    redshift_config = None
+    if args.redshift or args.redshift_upload:
+        redshift_config = RedshiftConfig(
+            credentials_path=args.redshift,
+            bucket=args.redshift_bucket,
+            upload=args.redshift_upload
+        )
+    
+    config = Config(
+        file_path=args.file,
+        table_name=args.table,
+        schema=args.schema,
+        delimiter=delimiter,
+        quote_char=args.quote,
+        detect_integers=args.integer,
+        detect_numeric=args.numeric,
+        detect_dates=args.date,
+        detect_timestamps=args.timestamp,
+        detect_json=args.json,
+        detect_jsonb=args.jsonb,
+        detect_arrays=args.array,
+        use_big_integers=args.big_integer,
+        use_timestamptz=args.tz,
+        clean_names=args.mogrify,
+        lowercase_names=args.lower,
+        drop_table=args.drop,
+        truncate_table=args.truncate,
+        create_schema=args.create_schema,
+        no_create=args.no_create,
+        temporary_table=args.temporary,
+        create_if_not_exists=args.cine,
+        fix_duplicates=args.fix_duplicates,
+        missing_headers=args.missing_headers,
+        is_gzipped=args.gzip,
+        transaction=args.transaction,
+        generate_copy=args.copy,
+        use_backslash_copy=args.backslash,
+        sample_rows=args.keep_going,
+        skip_parsing_cols=[c.strip() for c in (args.skip_parsing or "").split(",") if c.strip()],
+        parse_only_cols=[c.strip() for c in (args.parse_only or "").split(",") if c.strip()] if args.parse_only else None,
+        file_column=args.file_column,
+        serial_column=args.serial_column,
+        primary_key=args.primary_key,
+        redshift=redshift_config
+    )
+    
+    try:
+        # Analyze CSV and generate SQL
+        analyzer = CSVAnalyzer(config)
+        columns = analyzer.analyze()
+        
+        generator = SQLGenerator(config)
+        sql = generator.generate(columns)
+        
+        print(sql)
+        
+    except Exception as e:
+        sys.stderr.write(f"Error: {e}\n")
+        sys.exit(1)
+
+
+if __name__ == "__main__":
+    main()
